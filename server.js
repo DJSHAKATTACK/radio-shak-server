@@ -1,82 +1,166 @@
-const express = require('express');
-const cors = require('cors');
-const { spawn } = require('child_process');
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
+const express = require("express");
+const cors = require("cors");
+const { spawn } = require("child_process");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 const app = express();
-app.use(cors({ origin: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type'] }));
-app.use(express.json({ limit: '32kb' }));
+const PORT = process.env.PORT || 10000;
+const COOKIE_FILE = process.env.YTDLP_COOKIE_FILE || "/etc/secrets/cookies.txt";
 
-function isYouTubeUrl(value){
-  try{
-    const u = new URL(value);
-    return ['youtube.com','www.youtube.com','m.youtube.com','youtu.be','www.youtu.be','music.youtube.com'].includes(u.hostname);
-  }catch{return false;}
-}
+app.use(cors({
+  origin: true,
+  methods: ["GET", "POST", "OPTIONS"],
+  exposedHeaders: ["Content-Disposition", "Content-Type"]
+}));
+app.use(express.json({ limit: "1mb" }));
 
-app.get('/', (_req,res) => res.json({ok:true, service:'Radio Shak MP3 API', version:'1.1'}));
-app.get('/health', (_req,res) => res.json({ok:true, version:'1.1'}));
-
-app.post('/api/mp3', (req,res) => {
-  const url = String(req.body?.url || '').trim();
-  if(!isYouTubeUrl(url)) return res.status(400).json({error:'Lien YouTube invalide.'});
-
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(),'radioshak-'));
-  const template = path.join(dir, '%(title).120B.%(ext)s');
-
-  const args = [
-    '--no-playlist',
-    '--no-progress',
-    '--force-ipv4',
-    '--retries','3',
-    '--fragment-retries','3',
-    '--js-runtimes','node',
-    '--remote-components','ejs:github',
-    '--extractor-args','youtube:player_client=web_embedded,android_vr',
-    '-f','bestaudio/best',
-    '--extract-audio',
-    '--audio-format','mp3',
-    '--audio-quality','0',
-    '--restrict-filenames',
-    '-o',template,
-    url
-  ];
-
-  const p = spawn('yt-dlp', args, { stdio:['ignore','pipe','pipe'] });
-  let err='';
-  let out='';
-  p.stdout.on('data', d => { out += d.toString(); if(out.length > 6000) out = out.slice(-6000); });
-  p.stderr.on('data', d => { err += d.toString(); if(err.length > 12000) err = err.slice(-12000); });
-
-  const cleanup = () => { try{ fs.rmSync(dir,{recursive:true,force:true}); }catch{} };
-
-  p.on('error', e => {
-    cleanup();
-    if(!res.headersSent) res.status(500).json({error:'Impossible de démarrer yt-dlp.', detail:String(e.message||e)});
-  });
-
-  p.on('close', code => {
-    if(res.headersSent || res.writableEnded) return;
-    if(code !== 0){
-      const detail = (err || out || 'yt-dlp a quitté avec le code '+code).slice(-1800);
-      cleanup();
-      return res.status(500).json({error:'Conversion impossible.', detail});
-    }
-
-    let file;
-    try{ file = fs.readdirSync(dir).find(f => f.toLowerCase().endsWith('.mp3')); }catch{}
-    if(!file){
-      const detail = (err || out || 'Aucun fichier MP3 créé.').slice(-1800);
-      cleanup();
-      return res.status(500).json({error:'Fichier MP3 introuvable après conversion.', detail});
-    }
-
-    const full = path.join(dir,file);
-    res.download(full,file,cleanup);
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "Radio Shak MP3 API",
+    version: "1.2",
+    cookiesConfigured: fs.existsSync(COOKIE_FILE)
   });
 });
 
-const port = process.env.PORT || 10000;
-app.listen(port,'0.0.0.0',()=>console.log(`Radio Shak MP3 API v1.1 on ${port}`));
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    version: "1.2",
+    cookiesConfigured: fs.existsSync(COOKIE_FILE)
+  });
+});
+
+function isAllowedYouTubeUrl(value) {
+  try {
+    const u = new URL(value);
+    const host = u.hostname.replace(/^www\./, "").toLowerCase();
+    return ["youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"].includes(host);
+  } catch {
+    return false;
+  }
+}
+
+function cleanFilename(name) {
+  return (name || "radio-shak")
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120) || "radio-shak";
+}
+
+app.post("/api/mp3", async (req, res) => {
+  const url = String(req.body?.url || "").trim();
+
+  if (!url || !isAllowedYouTubeUrl(url)) {
+    return res.status(400).json({
+      ok: false,
+      error: "Lien YouTube invalide."
+    });
+  }
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "radio-shak-"));
+  const outputTemplate = path.join(tempDir, "%(title).120B [%(id)s].%(ext)s");
+
+  const args = [
+    "--no-playlist",
+    "--no-warnings",
+    "--newline",
+    "--js-runtimes", "node",
+    "--extractor-args", "youtube:player_client=web,web_safari,android_vr",
+    "-x",
+    "--audio-format", "mp3",
+    "--audio-quality", "0",
+    "--embed-metadata",
+    "--restrict-filenames",
+    "-o", outputTemplate,
+  ];
+
+  if (fs.existsSync(COOKIE_FILE)) {
+    args.push("--cookies", COOKIE_FILE);
+  }
+
+  args.push(url);
+
+  let stderr = "";
+  let stdout = "";
+
+  const proc = spawn("yt-dlp", args, {
+    cwd: tempDir,
+    env: {
+      ...process.env,
+      HOME: "/tmp"
+    }
+  });
+
+  proc.stdout.on("data", d => {
+    stdout += d.toString();
+    if (stdout.length > 20000) stdout = stdout.slice(-20000);
+  });
+
+  proc.stderr.on("data", d => {
+    stderr += d.toString();
+    if (stderr.length > 20000) stderr = stderr.slice(-20000);
+  });
+
+  proc.on("error", err => {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    return res.status(500).json({
+      ok: false,
+      error: "Impossible de démarrer yt-dlp.",
+      detail: err.message
+    });
+  });
+
+  proc.on("close", code => {
+    if (code !== 0) {
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+      return res.status(502).json({
+        ok: false,
+        error: fs.existsSync(COOKIE_FILE)
+          ? "YouTube a refusé la conversion malgré les cookies."
+          : "YouTube demande une authentification. Ajoute cookies.txt comme Secret File dans Render.",
+        detail: (stderr || stdout || `yt-dlp exit code ${code}`).trim(),
+        cookiesConfigured: fs.existsSync(COOKIE_FILE)
+      });
+    }
+
+    const files = fs.readdirSync(tempDir)
+      .filter(f => f.toLowerCase().endsWith(".mp3"));
+
+    if (!files.length) {
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+      return res.status(500).json({
+        ok: false,
+        error: "Le MP3 n'a pas été créé.",
+        detail: (stderr || stdout).trim()
+      });
+    }
+
+    const mp3Path = path.join(tempDir, files[0]);
+    const downloadName = cleanFilename(files[0].replace(/\.mp3$/i, "")) + ".mp3";
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename*=UTF-8''${encodeURIComponent(downloadName)}`
+    );
+
+    const stream = fs.createReadStream(mp3Path);
+    stream.pipe(res);
+
+    const cleanup = () => {
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    };
+    res.on("finish", cleanup);
+    res.on("close", cleanup);
+  });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Radio Shak MP3 API v1.2 on ${PORT}`);
+  console.log(`Cookie file: ${COOKIE_FILE}`);
+  console.log(`Cookies configured: ${fs.existsSync(COOKIE_FILE)}`);
+});
