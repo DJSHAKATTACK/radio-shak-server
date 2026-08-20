@@ -16,8 +16,8 @@ function isYouTubeUrl(value){
   }catch{return false;}
 }
 
-app.get('/', (_req,res) => res.json({ok:true, service:'Radio Shak MP3 API'}));
-app.get('/health', (_req,res) => res.json({ok:true}));
+app.get('/', (_req,res) => res.json({ok:true, service:'Radio Shak MP3 API', version:'1.1'}));
+app.get('/health', (_req,res) => res.json({ok:true, version:'1.1'}));
 
 app.post('/api/mp3', (req,res) => {
   const url = String(req.body?.url || '').trim();
@@ -25,9 +25,17 @@ app.post('/api/mp3', (req,res) => {
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(),'radioshak-'));
   const template = path.join(dir, '%(title).120B.%(ext)s');
+
   const args = [
     '--no-playlist',
     '--no-progress',
+    '--force-ipv4',
+    '--retries','3',
+    '--fragment-retries','3',
+    '--js-runtimes','node',
+    '--remote-components','ejs:github',
+    '--extractor-args','youtube:player_client=web_embedded,android_vr',
+    '-f','bestaudio/best',
     '--extract-audio',
     '--audio-format','mp3',
     '--audio-quality','0',
@@ -36,23 +44,39 @@ app.post('/api/mp3', (req,res) => {
     url
   ];
 
-  const p = spawn('yt-dlp', args, { stdio:['ignore','ignore','pipe'] });
+  const p = spawn('yt-dlp', args, { stdio:['ignore','pipe','pipe'] });
   let err='';
-  p.stderr.on('data', d => { err += d.toString(); if(err.length > 8000) err = err.slice(-8000); });
+  let out='';
+  p.stdout.on('data', d => { out += d.toString(); if(out.length > 6000) out = out.slice(-6000); });
+  p.stderr.on('data', d => { err += d.toString(); if(err.length > 12000) err = err.slice(-12000); });
 
   const cleanup = () => { try{ fs.rmSync(dir,{recursive:true,force:true}); }catch{} };
-  req.on('close', () => { if(!res.writableEnded){ try{p.kill('SIGTERM');}catch{} cleanup(); } });
 
-  p.on('error', () => { cleanup(); if(!res.headersSent) res.status(500).json({error:'yt-dlp n’est pas disponible sur le serveur.'}); });
+  p.on('error', e => {
+    cleanup();
+    if(!res.headersSent) res.status(500).json({error:'Impossible de démarrer yt-dlp.', detail:String(e.message||e)});
+  });
+
   p.on('close', code => {
     if(res.headersSent || res.writableEnded) return;
-    if(code !== 0){ cleanup(); return res.status(500).json({error:'Conversion impossible. '+err.slice(-500)}); }
-    const file = fs.readdirSync(dir).find(f => f.toLowerCase().endsWith('.mp3'));
-    if(!file){ cleanup(); return res.status(500).json({error:'Fichier MP3 introuvable après conversion.'}); }
+    if(code !== 0){
+      const detail = (err || out || 'yt-dlp a quitté avec le code '+code).slice(-1800);
+      cleanup();
+      return res.status(500).json({error:'Conversion impossible.', detail});
+    }
+
+    let file;
+    try{ file = fs.readdirSync(dir).find(f => f.toLowerCase().endsWith('.mp3')); }catch{}
+    if(!file){
+      const detail = (err || out || 'Aucun fichier MP3 créé.').slice(-1800);
+      cleanup();
+      return res.status(500).json({error:'Fichier MP3 introuvable après conversion.', detail});
+    }
+
     const full = path.join(dir,file);
     res.download(full,file,cleanup);
   });
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port,'0.0.0.0',()=>console.log(`Radio Shak MP3 API on ${port}`));
+const port = process.env.PORT || 10000;
+app.listen(port,'0.0.0.0',()=>console.log(`Radio Shak MP3 API v1.1 on ${port}`));
