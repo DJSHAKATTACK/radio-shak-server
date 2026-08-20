@@ -7,29 +7,58 @@ const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const COOKIE_FILE = process.env.YTDLP_COOKIE_FILE || "/etc/secrets/cookies.txt";
+
+const COOKIE_FILE =
+  process.env.YTDLP_COOKIE_FILE || "/etc/secrets/cookies.txt";
+
+const WRITABLE_COOKIE_FILE = "/tmp/youtube-cookies.txt";
+
+/*
+  Render monte les Secret Files en lecture seule.
+  On copie donc cookies.txt vers /tmp afin que yt-dlp
+  puisse le lire ET le mettre à jour.
+*/
+function prepareCookies() {
+  if (!fs.existsSync(COOKIE_FILE)) {
+    return false;
+  }
+
+  try {
+    if (!fs.existsSync(WRITABLE_COOKIE_FILE)) {
+      fs.copyFileSync(COOKIE_FILE, WRITABLE_COOKIE_FILE);
+    }
+
+    return fs.existsSync(WRITABLE_COOKIE_FILE);
+  } catch (err) {
+    console.error("Impossible de préparer cookies.txt :", err);
+    return false;
+  }
+}
+
+prepareCookies();
 
 app.use(cors({
   origin: true,
   methods: ["GET", "POST", "OPTIONS"],
   exposedHeaders: ["Content-Disposition", "Content-Type"]
 }));
+
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "Radio Shak MP3 API",
-    version: "1.2",
-    cookiesConfigured: fs.existsSync(COOKIE_FILE)
+    version: "1.3",
+    cookiesConfigured: prepareCookies()
   });
 });
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    version: "1.2",
-    cookiesConfigured: fs.existsSync(COOKIE_FILE)
+    version: "1.3",
+    cookiesConfigured: prepareCookies()
   });
 });
 
@@ -37,7 +66,13 @@ function isAllowedYouTubeUrl(value) {
   try {
     const u = new URL(value);
     const host = u.hostname.replace(/^www\./, "").toLowerCase();
-    return ["youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"].includes(host);
+
+    return [
+      "youtube.com",
+      "m.youtube.com",
+      "music.youtube.com",
+      "youtu.be"
+    ].includes(host);
   } catch {
     return false;
   }
@@ -61,31 +96,50 @@ app.post("/api/mp3", async (req, res) => {
     });
   }
 
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "radio-shak-"));
-  const outputTemplate = path.join(tempDir, "%(title).120B [%(id)s].%(ext)s");
+  const tempDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "radio-shak-")
+  );
+
+  const outputTemplate = path.join(
+    tempDir,
+    "%(title).120B [%(id)s].%(ext)s"
+  );
 
   const args = [
     "--no-playlist",
     "--no-warnings",
     "--newline",
-    "--js-runtimes", "node",
-    "--extractor-args", "youtube:player_client=web,web_safari,android_vr",
+    "--js-runtimes",
+    "node",
+    "--extractor-args",
+    "youtube:player_client=web,web_safari,android_vr",
     "-x",
-    "--audio-format", "mp3",
-    "--audio-quality", "0",
+    "--audio-format",
+    "mp3",
+    "--audio-quality",
+    "0",
     "--embed-metadata",
     "--restrict-filenames",
-    "-o", outputTemplate,
+    "-o",
+    outputTemplate
   ];
 
-  if (fs.existsSync(COOKIE_FILE)) {
-    args.push("--cookies", COOKIE_FILE);
+  const cookiesReady = prepareCookies();
+
+  /*
+    IMPORTANT :
+    on donne à yt-dlp la copie MODIFIABLE dans /tmp,
+    et non /etc/secrets/cookies.txt.
+  */
+  if (cookiesReady) {
+    args.push("--cookies", WRITABLE_COOKIE_FILE);
   }
 
   args.push(url);
 
   let stderr = "";
   let stdout = "";
+  let responseSent = false;
 
   const proc = spawn("yt-dlp", args, {
     cwd: tempDir,
@@ -97,16 +151,31 @@ app.post("/api/mp3", async (req, res) => {
 
   proc.stdout.on("data", d => {
     stdout += d.toString();
-    if (stdout.length > 20000) stdout = stdout.slice(-20000);
+
+    if (stdout.length > 20000) {
+      stdout = stdout.slice(-20000);
+    }
   });
 
   proc.stderr.on("data", d => {
     stderr += d.toString();
-    if (stderr.length > 20000) stderr = stderr.slice(-20000);
+
+    if (stderr.length > 20000) {
+      stderr = stderr.slice(-20000);
+    }
   });
 
   proc.on("error", err => {
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    if (responseSent) return;
+    responseSent = true;
+
+    try {
+      fs.rmSync(tempDir, {
+        recursive: true,
+        force: true
+      });
+    } catch {}
+
     return res.status(500).json({
       ok: false,
       error: "Impossible de démarrer yt-dlp.",
@@ -115,23 +184,48 @@ app.post("/api/mp3", async (req, res) => {
   });
 
   proc.on("close", code => {
+    if (responseSent) return;
+
     if (code !== 0) {
-      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+      responseSent = true;
+
+      try {
+        fs.rmSync(tempDir, {
+          recursive: true,
+          force: true
+        });
+      } catch {}
+
       return res.status(502).json({
         ok: false,
-        error: fs.existsSync(COOKIE_FILE)
+        error: cookiesReady
           ? "YouTube a refusé la conversion malgré les cookies."
           : "YouTube demande une authentification. Ajoute cookies.txt comme Secret File dans Render.",
-        detail: (stderr || stdout || `yt-dlp exit code ${code}`).trim(),
-        cookiesConfigured: fs.existsSync(COOKIE_FILE)
+        detail: (
+          stderr ||
+          stdout ||
+          `yt-dlp exit code ${code}`
+        ).trim(),
+        cookiesConfigured: cookiesReady
       });
     }
 
-    const files = fs.readdirSync(tempDir)
-      .filter(f => f.toLowerCase().endsWith(".mp3"));
+    const files = fs
+      .readdirSync(tempDir)
+      .filter(f =>
+        f.toLowerCase().endsWith(".mp3")
+      );
 
     if (!files.length) {
-      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+      responseSent = true;
+
+      try {
+        fs.rmSync(tempDir, {
+          recursive: true,
+          force: true
+        });
+      } catch {}
+
       return res.status(500).json({
         ok: false,
         error: "Le MP3 n'a pas été créé.",
@@ -139,28 +233,61 @@ app.post("/api/mp3", async (req, res) => {
       });
     }
 
-    const mp3Path = path.join(tempDir, files[0]);
-    const downloadName = cleanFilename(files[0].replace(/\.mp3$/i, "")) + ".mp3";
+    responseSent = true;
 
-    res.setHeader("Content-Type", "audio/mpeg");
+    const mp3Path = path.join(
+      tempDir,
+      files[0]
+    );
+
+    const downloadName =
+      cleanFilename(
+        files[0].replace(/\.mp3$/i, "")
+      ) + ".mp3";
+
+    res.setHeader(
+      "Content-Type",
+      "audio/mpeg"
+    );
+
     res.setHeader(
       "Content-Disposition",
       `attachment; filename*=UTF-8''${encodeURIComponent(downloadName)}`
     );
 
-    const stream = fs.createReadStream(mp3Path);
+    const stream =
+      fs.createReadStream(mp3Path);
+
     stream.pipe(res);
 
     const cleanup = () => {
-      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+      try {
+        fs.rmSync(tempDir, {
+          recursive: true,
+          force: true
+        });
+      } catch {}
     };
+
     res.on("finish", cleanup);
     res.on("close", cleanup);
   });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Radio Shak MP3 API v1.2 on ${PORT}`);
-  console.log(`Cookie file: ${COOKIE_FILE}`);
-  console.log(`Cookies configured: ${fs.existsSync(COOKIE_FILE)}`);
+  console.log(
+    `Radio Shak MP3 API v1.3 on ${PORT}`
+  );
+
+  console.log(
+    `Original cookie file: ${COOKIE_FILE}`
+  );
+
+  console.log(
+    `Writable cookie file: ${WRITABLE_COOKIE_FILE}`
+  );
+
+  console.log(
+    `Cookies configured: ${prepareCookies()}`
+  );
 });
